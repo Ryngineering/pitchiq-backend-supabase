@@ -38,6 +38,10 @@ create table if not exists public.user_profile (
   updated_at timestamptz not null default now()
 );
 
+alter table public.user_profile
+  add column if not exists is_approved boolean not null default false,
+  add column if not exists is_admin boolean not null default false;
+
 -- RLS for cricket_matches
 
 alter table public.cricket_matches enable row level security;
@@ -62,11 +66,12 @@ using (true);
 
 alter table public.user_profile enable row level security;
 
+drop policy if exists "profile_select_authenticated" on public.user_profile;
 create policy "profile_select_authenticated"
 on public.user_profile
 for select
 to authenticated
-using (true);
+using (auth.uid() = id or public.is_admin());
 
 -- NOTE: INSERT is intentionally omitted — profile rows are created exclusively
 -- by the tg_create_user_profile trigger on auth.users. Clients cannot insert.
@@ -77,6 +82,61 @@ for update
 to authenticated
 using (auth.uid() = id)
 with check (auth.uid() = id);
+
+create or replace function public.is_admin()
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+stable
+as $$
+declare
+  v_is_admin boolean;
+begin
+  select up.is_admin
+  into v_is_admin
+  from public.user_profile up
+  where up.id = auth.uid();
+
+  return coalesce(v_is_admin, false);
+end;
+$$;
+
+create or replace function public.tg_prevent_profile_privilege_escalation()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if (
+    old.is_approved is distinct from new.is_approved
+    or old.is_admin is distinct from new.is_admin
+  ) and not public.is_admin() then
+    raise exception 'Only admins can change approval settings.';
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_prevent_profile_privilege_escalation on public.user_profile;
+create trigger trg_prevent_profile_privilege_escalation
+before update on public.user_profile
+for each row execute function public.tg_prevent_profile_privilege_escalation();
+
+drop policy if exists "admin_can_update_any_profile" on public.user_profile;
+create policy "admin_can_update_any_profile"
+on public.user_profile
+for update
+to authenticated
+using (public.is_admin())
+with check (public.is_admin());
+
+-- One-time bootstrap after your first login:
+-- update public.user_profile
+-- set is_approved = true, is_admin = true
+-- where email = 'you@example.com';
 
 -- DB trigger: auto-create a minimal profile row when a new auth user is created.
 -- This fires before the client upsert and guarantees the row always exists.
@@ -352,9 +412,8 @@ using (
   )
 );
 
--- 11) Leaderboard view (rank + pts + correct + total — excludes void from totals)
 create or replace view public.leaderboard
-with (security_invoker = true) as
+with (security_invoker = false) as
 select
   upf.id as user_id,
   coalesce(upf.display_name, split_part(upf.email, '@', 1), 'Player') as name,
