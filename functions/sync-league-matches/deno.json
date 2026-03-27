@@ -1,0 +1,9 @@
+{
+  "imports": {
+    "@supabase/functions-js": "jsr:@supabase/functions-js@^2",
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@2"
+  },
+  "tasks": {
+    "dev": "deno run --allow-net --allow-env supabase functions serve sync-league-matches"
+  }
+}

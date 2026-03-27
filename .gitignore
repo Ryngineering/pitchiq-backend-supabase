@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Environment files
+.env
+.env.*
+!.env.example
+functions/**/.env
+
+# Supabase local state
+.supabase/
+
+# Dependencies
+node_modules/
+
+# Logs
+*.log
