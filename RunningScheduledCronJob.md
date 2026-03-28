@@ -1,88 +1,146 @@
-# Running a Scheduled Cron Job for Live Match Sync
+# Scheduled Live Score Sync (Function-Based)
 
-This cron setup is used to invoke the `sync-match` Edge Function at regular intervals so live scores and predictions stay updated.
+This document explains the updated cron design for live score and prediction updates.
 
-How it works:
-- The cron runs every minute.
-- On each run, it finds matches that have already started (`start_date_time <= now()`).
-- It limits work to recent matches (last 12 hours).
-- It skips terminal match states using `public.is_match_terminal(...)`.
-- For each eligible match, it calls the Edge Function with the match ID.
+## Why this version is more reliable
 
-## 1) Enable required extensions
+You moved from running the full HTTP logic directly in `cron.schedule(...)` to calling a dedicated SQL function (`public.trigger_match_syncs()`).
 
-This enables:
-- `pg_cron` for scheduling recurring jobs.
-- `pg_net` for making HTTP calls from SQL.
+This helps because:
+- The cron payload stays simple (`SELECT public.trigger_match_syncs();`).
+- Function-level logging (`RAISE LOG`) makes each run visible in `cron.job_run_details`.
+- A second cleanup scheduler keeps `net._http_response` small, which can prevent silent failures over time.
 
-```sql
-create extension if not exists pg_cron;
-create extension if not exists pg_net;
-```
+## 1) Create or update the sync function
 
-## 2) Schedule the job (runs every minute)
-
-This registers a cron job named `sync-active-matches` with schedule `* * * * *` (every minute). The job sends an HTTP POST request to the `sync-match` Edge Function for each match that is due and non-terminal.
-
-Replace `<YOUR_API_KEY>` with a valid key (for example, your Supabase service role key if appropriate for your security model).
+What this does:
+- Finds only due matches (`start_date_time <= now()`).
+- Restricts to recent matches (last 12 hours).
+- Skips terminal matches (`NOT public.is_match_terminal(...)`).
+- Calls the `sync-match` Edge Function once per eligible match.
+- Logs how many requests were dispatched.
 
 ```sql
-select cron.schedule(
-  'sync-active-matches',
-  '* * * * *',
-  $$
-    select net.http_post(
+CREATE OR REPLACE FUNCTION public.trigger_match_syncs()
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  match_row RECORD;
+  request_count INT := 0;
+BEGIN
+  FOR match_row IN
+    SELECT id
+    FROM public.cricket_matches
+    WHERE start_date_time <= now()
+      AND start_date_time >= now() - interval '12 hours'
+      AND NOT public.is_match_terminal(coalesce(status, ''))
+  LOOP
+    PERFORM net.http_post(
       url     := 'https://evgwdwsintxaiafscvwt.supabase.co/functions/v1/sync-match',
       headers := jsonb_build_object(
-                   'Authorization', 'Bearer <YOUR_API_KEY>',
+                   'Authorization', 'Bearer <token>',
                    'Content-Type',  'application/json'
                  ),
-      body    := jsonb_build_object('matchId', id)
-    )
-    from public.cricket_matches
-    where start_date_time <= now()
-      and start_date_time >= now() - interval '12 hours'
-      and not public.is_match_terminal(coalesce(status, ''));
-  $$
+      body    := jsonb_build_object('matchId', match_row.id)
+    );
+
+    request_count := request_count + 1;
+  END LOOP;
+
+  RAISE LOG 'trigger_match_syncs: dispatched % requests at %', request_count, now();
+END;
+$$;
+```
+
+## 2) Replace old scheduler (if already created)
+
+What this does:
+- Removes the old `sync-active-matches` job so you do not end up with duplicate schedulers.
+
+```sql
+SELECT cron.unschedule('sync-active-matches');
+```
+
+## 3) Schedule the sync job
+
+What this does:
+- Runs the function on a regular interval.
+- Current setup runs every 30 seconds.
+
+```sql
+SELECT cron.schedule(
+  'sync-active-matches',
+  '30 seconds',
+  $$ SELECT public.trigger_match_syncs(); $$
 );
 ```
 
-## 3) Verify the job is registered
-
-Use this to confirm the cron job exists and is active.
+Optional minute-based schedule (if you prefer standard cron syntax):
 
 ```sql
-select jobid, jobname, schedule, active
-from cron.job;
+-- SELECT cron.schedule(
+--   'sync-active-matches',
+--   '* * * * *',
+--   $$ SELECT public.trigger_match_syncs(); $$
+-- );
 ```
 
-## 4) Check recent execution history
+## 4) Schedule cleanup for pg_net responses
 
-Use this to review whether recent runs succeeded or failed.
+What this does:
+- Every 10 minutes, deletes stale rows from `net._http_response` older than 30 minutes.
+- Reduces response-table buildup that may contribute to jobs terminating unexpectedly.
 
 ```sql
-select jobid, status, start_time, return_message
-from cron.job_run_details
-order by start_time desc
-limit 10;
+SELECT cron.schedule(
+  'purge-net-responses',
+  '*/10 * * * *',
+  $$ DELETE FROM net._http_response WHERE created < now() - interval '30 minutes'; $$
+);
 ```
 
-## 5) Preview which matches are eligible for sync
+## 5) Check recent cron runs
 
-This helps validate that your filter picks only started, recent, non-terminal matches.
+What this does:
+- Shows execution history for `sync-active-matches`.
+- Includes `return_message` where function logs appear.
 
 ```sql
-select id, status, start_date_time
-from public.cricket_matches
-where start_date_time <= now()
-  and start_date_time >= now() - interval '12 hours'
-  and not public.is_match_terminal(coalesce(status, ''));
+SELECT
+  start_time,
+  end_time,
+  status,
+  return_message
+FROM cron.job_run_details
+WHERE jobid = (
+  SELECT jobid
+  FROM cron.job
+  WHERE jobname = 'sync-active-matches'
+)
+ORDER BY start_time DESC
+LIMIT 10;
 ```
 
-## 6) Unschedule the job (if needed)
-
-Use this when you need to stop the recurring job.
+## 6) Useful checks and notes
 
 ```sql
-select cron.unschedule('sync-active-matches');
+-- List active cron jobs
+SELECT jobid, jobname, schedule, active
+FROM cron.job
+ORDER BY jobid;
 ```
+
+```sql
+-- Quick view of eligible matches for sync
+SELECT id, status, start_date_time
+FROM public.cricket_matches
+WHERE start_date_time <= now()
+  AND start_date_time >= now() - interval '12 hours'
+  AND NOT public.is_match_terminal(coalesce(status, ''));
+```
+
+Operational notes:
+- Replace `<token>` with the correct key for your deployment model.
+- Keep both schedulers enabled: one for sync, one for cleanup.
+- If runs stop unexpectedly, first inspect `cron.job_run_details`, then verify `purge-net-responses` is executing on schedule.
