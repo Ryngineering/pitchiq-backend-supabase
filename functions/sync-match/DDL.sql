@@ -74,7 +74,15 @@ to authenticated
 using (auth.uid() = id or public.is_admin());
 
 -- NOTE: INSERT is intentionally omitted — profile rows are created exclusively
--- by the tg_create_user_profile trigger on auth.users. Clients cannot insert.
+-- by the tg_create_user_profile trigger on auth.users. We still allow
+-- authenticated users to insert ONLY their own row as a safe fallback.
+drop policy if exists "profile_insert_own" on public.user_profile;
+create policy "profile_insert_own"
+on public.user_profile
+for insert
+to authenticated
+with check (auth.uid() = id);
+
 drop policy if exists "profile_update_own" on public.user_profile;
 create policy "profile_update_own"
 on public.user_profile
@@ -509,3 +517,31 @@ on conflict (league_id, season) do nothing;
 -- alter table to add start_date_time to cricket_matches for better scheduling and prediction timing logic
 alter table public.cricket_matches
 add column if not exists start_date_time timestamptz;
+
+-- ============================================================
+-- FEATURE: Crowd pick counts for social-proof tooltip
+-- Exposes aggregated pick counts per team per match.
+-- SECURITY DEFINER bypasses user_predictions RLS (which only
+-- lets users read their OWN rows) but only returns COUNT
+-- aggregates — no user_id or personal data is ever exposed.
+-- Run this block once in the Supabase SQL editor.
+-- ============================================================
+
+create or replace function public.get_match_pick_counts(p_match_ids bigint[])
+returns table(match_id bigint, picked_team_id bigint, pick_count bigint)
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select
+    up.match_id,
+    up.picked_team_id,
+    count(*)::bigint as pick_count
+  from public.user_predictions up
+  where up.match_id = any(p_match_ids)
+    and up.result != 'void'::public.prediction_result
+  group by up.match_id, up.picked_team_id;
+$$;
+
+grant execute on function public.get_match_pick_counts(bigint[]) to authenticated;

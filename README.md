@@ -131,6 +131,44 @@ Set at least your external API key (and any overrides you need):
 supabase secrets set HIGHLIGHTLY_API_KEY=<your-rapidapi-key>
 ```
 
+For `ai-help`, also set:
+
+```bash
+supabase secrets set BRAVE_API_KEY=<your-brave-api-key>
+supabase secrets set OPENAI_API_KEY=<your-openai-api-key>
+```
+
+Optional `ai-help` model routing (defaults shown):
+
+```bash
+supabase secrets set AI_HELP_LLM_ANALYST_MODEL=gpt-4.1-mini
+supabase secrets set AI_HELP_LLM_COMPOSER_MODEL=gpt-4o-mini
+supabase secrets set AI_HELP_LLM_ARBITER_MODEL=gpt-4.1-mini
+```
+
+Optional `ai-help` decision fusion tuning:
+
+```bash
+supabase secrets set AI_HELP_HYBRID_AGREE_LLM_WEIGHT=0.3
+supabase secrets set AI_HELP_HYBRID_DISAGREE_LLM_WEIGHT=0.2
+supabase secrets set AI_HELP_HYBRID_OVERRIDE_LLM_WEIGHT=0.45
+supabase secrets set AI_HELP_DETERMINISTIC_WEAK_MAX_CONFIDENCE=60
+supabase secrets set AI_HELP_DETERMINISTIC_WEAK_MAX_EDGE=8
+supabase secrets set AI_HELP_LLM_OVERRIDE_MIN_CONFIDENCE=72
+```
+
+To enable verbose debugging logs (Brave request/response payloads and LLM prompt/response payloads):
+
+```bash
+supabase secrets set AI_HELP_VERBOSE_LOGS=true
+```
+
+To disable verbose debugging logs:
+
+```bash
+supabase secrets set AI_HELP_VERBOSE_LOGS=false
+```
+
 `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are provided in Supabase Functions runtime.
 
 ### 4) Deploy function
@@ -143,6 +181,12 @@ supabase functions deploy sync-match
 
 ```bash
 supabase functions deploy hello-world
+```
+
+Deploy `ai-help`:
+
+```bash
+supabase functions deploy ai-help
 ```
 
 ### 5) Invoke cloud function
@@ -161,3 +205,53 @@ curl -i --location --request POST 'https://<your-project-ref>.supabase.co/functi
 - `sync-match` uses the service role key server-side to upsert into `cricket_matches`.
 - Keep service role keys only in secure runtime secrets, never in frontend code.
 - The function currently expects the Highlightly API response as an array and uses `data[0]`.
+
+---
+
+## AI Help Runtime Notes
+
+`functions/ai-help` uses a hybrid decision pipeline:
+
+1. Deterministic scoring computes recommendation, confidence, and factor breakdown.
+2. Brave search snippets are collected as external context.
+3. LLM workflow runs three stages:
+  - deep analysis
+  - final composition
+  - decision arbiter
+4. Final recommendation and confidence are fused from deterministic + LLM signals.
+
+The final payload includes debug fields such as:
+- `deterministicScore`
+- `factorBreakdown`
+- `llmCallsUsed`
+- `llmRecommendedTeamId`
+- `llmConfidence`
+- `finalDecisionSource`
+
+One-request-per-match is enforced via `ai_help_usage` + `claim_ai_help`.
+To re-run AI Help for the same user/match, an admin must delete that usage row.
+
+### Recommended Fusion Profiles
+
+Use these as practical starting points for production. Keep model choices constant and tune only the fusion knobs first.
+
+| Profile | Use Case | AI_HELP_HYBRID_AGREE_LLM_WEIGHT | AI_HELP_HYBRID_DISAGREE_LLM_WEIGHT | AI_HELP_HYBRID_OVERRIDE_LLM_WEIGHT | AI_HELP_DETERMINISTIC_WEAK_MAX_CONFIDENCE | AI_HELP_DETERMINISTIC_WEAK_MAX_EDGE | AI_HELP_LLM_OVERRIDE_MIN_CONFIDENCE |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Conservative | Prefer deterministic stability, only rare LLM overrides | 0.25 | 0.10 | 0.35 | 58 | 6 | 82 |
+| Balanced (default-like) | Good general production baseline | 0.30 | 0.20 | 0.45 | 60 | 8 | 72 |
+| Aggressive | Let LLM adapt more often in volatile live matches | 0.40 | 0.30 | 0.55 | 64 | 10 | 66 |
+
+Operational guidance:
+- Start with Balanced for 1-2 weeks and compare win-rate calibration vs your current baseline.
+- Move toward Conservative if recommendations become noisy or flip too often.
+- Move toward Aggressive if deterministic logic is lagging late-innings momentum shifts.
+- Change one knob at a time, then monitor at least 100+ decisions before the next adjustment.
+
+### Run tests for `ai-help`
+
+From `functions/ai-help/`:
+
+```bash
+deno test _tests/scoring.test.ts --no-check
+deno test _tests/handler.test.ts --no-check --allow-env
+```
