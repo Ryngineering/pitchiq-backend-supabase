@@ -151,13 +151,15 @@ with check (public.is_admin());
 create or replace function public.tg_create_user_profile()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
-  insert into public.user_profile (id, email, display_name, avatar_url)
+  insert into public.user_profile (id, email, phone_number, display_name, avatar_url)
   values (
     new.id,
     new.email,
+    new.phone,
     coalesce(
       new.raw_user_meta_data->>'full_name',
       new.raw_user_meta_data->>'name',
+      case when new.phone is not null then ('User ' || right(new.phone, 4)) else null end,
       split_part(new.email, '@', 1)
     ),
     new.raw_user_meta_data->>'avatar_url'
@@ -545,3 +547,79 @@ as $$
 $$;
 
 grant execute on function public.get_match_pick_counts(bigint[]) to authenticated;
+
+-- ============================================================
+-- FEATURE: Phone registration controls + audit log
+-- Shared registration link flow with admin-configurable toggle/window/code.
+-- ============================================================
+
+alter table public.user_profile
+  add column if not exists phone_number text;
+
+create table if not exists public.phone_registration_control (
+  id bigint primary key default 1,
+  enabled boolean not null default false,
+  window_start timestamptz,
+  window_end timestamptz,
+  invite_code_hash text,
+  max_attempts_per_ip_per_hour integer not null default 20,
+  max_attempts_per_phone_per_hour integer not null default 10,
+  updated_by uuid references public.user_profile(id),
+  updated_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  constraint ck_registration_control_singleton check (id = 1)
+);
+
+insert into public.phone_registration_control (id)
+values (1)
+on conflict (id) do nothing;
+
+create table if not exists public.phone_registration_attempts (
+  id bigserial primary key,
+  phone_number text,
+  ip_address text,
+  success boolean not null default false,
+  failure_reason text,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_phone_registration_attempts_created_at
+  on public.phone_registration_attempts(created_at desc);
+
+create index if not exists idx_phone_registration_attempts_phone_created_at
+  on public.phone_registration_attempts(phone_number, created_at desc);
+
+create index if not exists idx_phone_registration_attempts_ip_created_at
+  on public.phone_registration_attempts(ip_address, created_at desc);
+
+alter table public.phone_registration_control enable row level security;
+alter table public.phone_registration_attempts enable row level security;
+
+drop policy if exists "registration_control_admin_select" on public.phone_registration_control;
+create policy "registration_control_admin_select"
+on public.phone_registration_control
+for select
+to authenticated
+using (public.is_admin());
+
+drop policy if exists "registration_control_admin_update" on public.phone_registration_control;
+create policy "registration_control_admin_update"
+on public.phone_registration_control
+for update
+to authenticated
+using (public.is_admin())
+with check (public.is_admin());
+
+drop policy if exists "registration_control_admin_insert" on public.phone_registration_control;
+create policy "registration_control_admin_insert"
+on public.phone_registration_control
+for insert
+to authenticated
+with check (public.is_admin());
+
+drop policy if exists "registration_attempts_admin_select" on public.phone_registration_attempts;
+create policy "registration_attempts_admin_select"
+on public.phone_registration_attempts
+for select
+to authenticated
+using (public.is_admin());
