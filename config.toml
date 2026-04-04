@@ -235,7 +235,7 @@ otp_expiry = 3600
 
 [auth.sms]
 # Allow/disallow new user signups via SMS to your project.
-enable_signup = false
+enable_signup = true
 # If enabled, users need to confirm their phone number before signing in.
 enable_confirmations = false
 # Template for sending OTP to users
@@ -407,6 +407,19 @@ entrypoint = "./functions/sync-match/index.ts"
 
 [functions.ai-help]
 enabled = true
-verify_jwt = false
+verify_jwt = true
 import_map = "./functions/ai-help/deno.json"
 entrypoint = "./functions/ai-help/index.ts"
+
+
+[functions.register-phone-user]
+enabled = true
+verify_jwt = false
+import_map = "./functions/register-phone-user/deno.json"
+entrypoint = "./functions/register-phone-user/index.ts"
+
+[functions.admin-registration-config]
+enabled = true
+verify_jwt = false
+import_map = "./functions/admin-registration-config/deno.json"
+entrypoint = "./functions/admin-registration-config/index.ts"

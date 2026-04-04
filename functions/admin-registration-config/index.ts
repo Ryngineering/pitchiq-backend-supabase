@@ -1,5 +1,6 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "@supabase/supabase-js";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -15,6 +16,8 @@ type AdminConfigPayload = {
   windowEnd?: string | null;
   inviteCode?: string | null;
 };
+
+const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 
 function jsonResponse(body: Record<string, unknown>, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -33,10 +36,52 @@ async function sha256(input: string) {
   return arr.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function getRemoteJwks(supabaseUrl: string) {
+  const existing = jwksCache.get(supabaseUrl);
+
+  if (existing) {
+    return existing;
+  }
+
+  const jwks = createRemoteJWKSet(
+    new URL(`${supabaseUrl}/auth/v1/.well-known/jwks.json`),
+  );
+
+  jwksCache.set(supabaseUrl, jwks);
+  return jwks;
+}
+
+async function verifySupabaseAccessToken(
+  supabaseUrl: string,
+  accessToken: string,
+) {
+  try {
+    const { payload } = await jwtVerify(
+      accessToken,
+      getRemoteJwks(supabaseUrl),
+      {
+        issuer: `${supabaseUrl}/auth/v1`,
+        audience: "authenticated",
+      },
+    );
+
+    const userId = typeof payload.sub === "string" ? payload.sub : null;
+
+    if (!userId) {
+      return { ok: false, userId: null };
+    }
+
+    return { ok: true, userId };
+  } catch {
+    return { ok: false, userId: null };
+  }
+}
+
 async function assertAdmin(
   supabaseUrl: string,
   anonKey: string,
   accessToken: string,
+  expectedUserId: string,
 ) {
   const userClient = createClient(supabaseUrl, anonKey, {
     auth: { persistSession: false },
@@ -55,7 +100,13 @@ async function assertAdmin(
     userClient.auth.getUser(),
   ]);
 
-  if (isAdminError || userError || !adminStatus || !userData.user?.id) {
+  if (
+    isAdminError ||
+    userError ||
+    !adminStatus ||
+    !userData.user?.id ||
+    userData.user.id !== expectedUserId
+  ) {
     return { ok: false, userId: null };
   }
 
@@ -91,7 +142,18 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: "Unauthorized" }, 401);
   }
 
-  const adminCheck = await assertAdmin(supabaseUrl, anonKey, accessToken);
+  const tokenCheck = await verifySupabaseAccessToken(supabaseUrl, accessToken);
+
+  if (!tokenCheck.ok || !tokenCheck.userId) {
+    return jsonResponse({ error: "Invalid JWT" }, 401);
+  }
+
+  const adminCheck = await assertAdmin(
+    supabaseUrl,
+    anonKey,
+    accessToken,
+    tokenCheck.userId,
+  );
 
   if (!adminCheck.ok || !adminCheck.userId) {
     return jsonResponse({ error: "Forbidden" }, 403);
